@@ -101,7 +101,13 @@ const rideRequestSchema = new mongoose.Schema(
     batch_id: 
     {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "RideBatch"
+      ref: "Batched"
+    },
+
+    cluster_id: 
+    {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Clustering"
     },
 
     parent_request_id: 

@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import { RideRequest } from "./ride.model.js";
 import { Office } from "../office/office.model.js";
 import ApiResponse from "../../utils/ApiResponse.js";
@@ -364,15 +365,23 @@ export const getRideById = async (req, res, next) => {
     if (!["CANCELLED", "COMPLETED", "DROPPED_OFF", "REJECTED"].includes(ride.status)) {
       const { Clustering } = await import('../polling/clustering.model.js');
       const { Batched } = await import('../polling/batched.model.js');
+      
+      const rideObjectId = new mongoose.Types.ObjectId(ride._id);
 
-      // 1. Try to find a batch (highest priority)
-      const batch = await Batched.findOne({ 
-        $or: [
-          { _id: ride.batch_id },
-          { ride_ids: ride._id }
-        ]
-      });
+      // 1. ATOMIC LOAD: Use the hard-links established by the polling service
+      const batchId = ride.batch_id;
+      const clusterId = ride.cluster_id;
 
+      let batch = batchId ? await Batched.findById(batchId) : null;
+      let cluster = clusterId ? await Clustering.findById(clusterId) : null;
+
+      // BREADCRUMB SAFETY: If we found a cluster but it points to a batch, follow it
+      if (!batch && cluster?.batch_id) {
+        batch = await Batched.findById(cluster.batch_id);
+      }
+
+      // 2. STATUS REPAIR FAILSAFE:
+      // If the Ride is physically in a group but the record is lagging, repair it on-the-fly
       if (batch) {
         responseData.batch = {
           batch_id: batch._id,
@@ -381,20 +390,53 @@ export const getRideById = async (req, res, next) => {
           pickup_polyline: batch.pickup_polyline,
           driver_id: batch.driver_id,
         };
-        // If we found a batch, we also ensure status reflection for the frontend
-        if (ride.status === 'PENDING') responseData.status = 'CLUSTERED';
-      } else {
-        // 2. Try to find a cluster
-        const cluster = await Clustering.findOne({ ride_ids: ride._id });
-        if (cluster) {
-          responseData.clustering = {
-            cluster_id: cluster._id,
-            current_size: cluster.current_size,
-            status: cluster.status,
-            pickup_polyline: cluster.pickup_polyline,
-          };
-          if (ride.status === 'PENDING') responseData.status = 'IN_CLUSTERING';
+        // Forced Repair: Any ride in a batch is CLUSTERED
+        if (ride.status !== 'CLUSTERED' && ride.status !== 'COMPLETED') {
+          console.log(`[Sync-Repair] Forcing Ride ${ride._id} status to CLUSTERED (was ${ride.status})`);
+          responseData.status = 'CLUSTERED'; 
         }
+      } else if (cluster) {
+        responseData.clustering = {
+          cluster_id: cluster._id,
+          current_size: cluster.current_size,
+          status: cluster.status,
+          pickup_polyline: cluster.pickup_polyline,
+        };
+        // Forced Repair: Any ride in an active cluster is IN_CLUSTERING
+        if (ride.status === 'PENDING') {
+          console.log(`[Sync-Repair] Forcing Ride ${id} status to IN_CLUSTERING (was PENDING)`);
+          responseData.status = 'IN_CLUSTERING';
+        }
+      }
+
+      // 3. UNIFIED MANIFEST: Load all participants from the group
+      const targetRides = batch?.ride_ids || cluster?.ride_ids || [];
+      if (targetRides.length > 0) {
+        const groupRides = await RideRequest.find({ _id: { $in: targetRides } })
+          .populate('employee_id', 'name email profile_image')
+          .populate('invited_employee_ids', 'name email profile_image');
+
+        const participantsMap = new Map();
+        groupRides.forEach(gr => {
+          if (gr.employee_id) {
+            participantsMap.set(gr.employee_id._id.toString(), {
+              ...gr.employee_id.toObject(),
+              is_requester: true,
+              ride_id: gr._id,
+              pickup_location: gr.pickup_location
+            });
+          }
+          gr.invited_employee_ids.forEach(inv => {
+            participantsMap.set(inv._id.toString(), {
+              ...inv.toObject(),
+              is_requester: false,
+              ride_id: gr._id,
+              pickup_location: gr.pickup_location
+            });
+          });
+        });
+
+        responseData.group_participants = Array.from(participantsMap.values());
       }
     }
 
