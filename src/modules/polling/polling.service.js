@@ -5,65 +5,13 @@ import { getDistance } from "../../utils/geo.js";
 import ApiError from "../../utils/ApiError.js";
 import { getEmployeesInRideGroup } from "../ride/ride.service.js";
 import * as turf from "@turf/turf";
+import { getRoute } from "../../utils/osrm.js";
+import mongoose from "mongoose";
 
 const ROUTE_BUFFER_METERS = 500;
 const TIME_WINDOW_MINUTES = 10;
 const MAX_CLUSTER_SIZE = 4;
 
-/**
- * STEP 1 (CHEAP PRE-FILTER): Check bearing similarity and bounding box overlap
- * Returns true if worth doing full polyline check
- */
-export const checkBearingAndBoundingBox = (
-  existingPickupCoords,
-  existingDropCoords,
-  newPickupCoords,
-  newDropCoords
-) => {
-  try {
-    // Calculate bearings from pickup to drop for both rides
-    const existingBearing = turf.bearing(
-      turf.point(existingPickupCoords),
-      turf.point(existingDropCoords)
-    );
-    const newBearing = turf.bearing(
-      turf.point(newPickupCoords),
-      turf.point(newDropCoords)
-    );
-
-    // Check if bearings are similar (within 45 degrees)
-    const bearingDiff = Math.abs(existingBearing - newBearing);
-    const normalizedBearingDiff = bearingDiff > 180 ? 360 - bearingDiff : bearingDiff;
-    if (normalizedBearingDiff > 45) {
-      return false; // Bearings too different
-    }
-
-    // Check bounding box overlap
-    const existingBox = turf.bbox([
-      turf.point(existingPickupCoords),
-      turf.point(existingDropCoords),
-    ]);
-    const newBox = turf.bbox([
-      turf.point(newPickupCoords),
-      turf.point(newDropCoords),
-    ]);
-
-    // Simple AABB overlap check
-    if (
-      existingBox[0] > newBox[2] ||
-      existingBox[2] < newBox[0] ||
-      existingBox[1] > newBox[3] ||
-      existingBox[3] < newBox[1]
-    ) {
-      return false; // No bounding box overlap
-    }
-
-    return true; // Pre-filter passed, worth checking full polyline
-  } catch (error) {
-    console.error("Error in checkBearingAndBoundingBox:", error);
-    return false;
-  }
-};
 
 /**
  * STEP 2 (FULL CHECK): Check if new pickup is within route buffer of existing polyline
@@ -99,7 +47,7 @@ export const isWithinTimeWindow = (time1, time2, windowMinutes = TIME_WINDOW_MIN
 /**
  * Check if two drop locations are similar (within 100 meters)
  */
-export const isSimilarDropLocation = (drop1, drop2, threshold = 100) => {
+export const isSimilarDropLocation = (drop1, drop2, threshold = 200) => {
   const distance = getDistance(drop1, drop2);
   return distance <= threshold;
 };
@@ -107,7 +55,7 @@ export const isSimilarDropLocation = (drop1, drop2, threshold = 100) => {
 /**
  * Check if two pickup locations are similar (within 100 meters)
  */
-export const isSimilarPickupLocation = (pickup1, pickup2, threshold = 100) => {
+export const isSimilarPickupLocation = (pickup1, pickup2, threshold = 200) => {
   const distance = getDistance(pickup1, pickup2);
   return distance <= threshold;
 };
@@ -149,18 +97,6 @@ export const can_cluster = async (newRide, existingCluster) => {
 
     // CONDITION 2: New pickup within route buffer of existing polyline + similar drop + within time window
     if (existingCluster.pickup_polyline) {
-      // Pre-filter: Check bearing and bounding box first
-      const preFilterPass = checkBearingAndBoundingBox(
-        existingPickup,
-        existingDrop,
-        newPickup,
-        newDrop
-      );
-
-      if (!preFilterPass) {
-        return false;
-      }
-
       // Full check: Check actual polyline distance
       const inBuffer = checkPolylineRouteBuffer(
         existingCluster.pickup_polyline,
@@ -169,6 +105,7 @@ export const can_cluster = async (newRide, existingCluster) => {
       );
 
       if (inBuffer) {
+        console.log(`[Clustering] Match found: Ride ${newRide._id} is within ${ROUTE_BUFFER_METERS}m of cluster ${existingCluster._id} polyline.`);
         return true;
       }
     }
@@ -257,6 +194,10 @@ export const handleCase1_SoloPreference = async (ride) => {
       batch_size: 1,
       pickup_centroid: ride.pickup_location,
       drop_location: ride.drop_location,
+      pickup_polyline: {
+        type: "LineString",
+        coordinates: await getRoute([ride.pickup_location.coordinates, ride.drop_location.coordinates]),
+      },
       status: "CREATED",
       metadata: {
         force_batched: false,
@@ -293,7 +234,7 @@ export const handleCase2_SinglePersonNoClustering = async (ride, officeId, sched
       drop_location: ride.drop_location,
       pickup_polyline: {
         type: "LineString",
-        coordinates: [ride.pickup_location.coordinates],
+        coordinates: await getRoute([ride.pickup_location.coordinates, ride.drop_location.coordinates]),
       },
       status: "IN_CLUSTERING",
     });
@@ -373,7 +314,7 @@ export const handleCase4_GroupSize2 = async (ride, officeId, scheduledAt) => {
         drop_location: ride.drop_location,
         pickup_polyline: {
           type: "LineString",
-          coordinates: [ride.pickup_location.coordinates],
+          coordinates: await getRoute([ride.pickup_location.coordinates, ride.drop_location.coordinates]),
         },
         status: "IN_CLUSTERING",
       });
@@ -431,7 +372,7 @@ export const handleCase5_GroupSize3 = async (ride, officeId, scheduledAt) => {
         drop_location: ride.drop_location,
         pickup_polyline: {
           type: "LineString",
-          coordinates: [ride.pickup_location.coordinates],
+          coordinates: await getRoute([ride.pickup_location.coordinates, ride.drop_location.coordinates]),
         },
         status: "IN_CLUSTERING",
       });
@@ -463,6 +404,10 @@ export const handleCase6_GroupSize4 = async (ride) => {
       batch_size: employees.length,
       pickup_centroid: ride.pickup_location,
       drop_location: ride.drop_location,
+      pickup_polyline: {
+        type: "LineString",
+        coordinates: await getRoute([ride.pickup_location.coordinates, ride.drop_location.coordinates]),
+      },
       status: "CREATED",
       metadata: {
         force_batched: false,
@@ -471,7 +416,7 @@ export const handleCase6_GroupSize4 = async (ride) => {
     });
 
     await RideRequest.findByIdAndUpdate(ride._id, {
-      status: "BOOKED_SOLO", // Group is treated as single entity
+      status: "CLUSTERED", // Group is treated as a full carpool batch
       batch_id: batched._id,
     });
 
@@ -495,12 +440,32 @@ export const mergeClusters = async (newRide, existingCluster) => {
       throw new ApiError(400, "Cannot merge: would exceed max cluster size");
     }
 
-    // Add ride to cluster
+    // Update ride status
+    await RideRequest.findByIdAndUpdate(newRide._id, {
+      status: "IN_CLUSTERING",
+    });
+
+    // RECALCULATE ROUTE: Add all pickups and common drop
+    const allRideIds = [...existingCluster.ride_ids, newRide._id];
+    const allRides = await RideRequest.find({ _id: { $in: allRideIds } });
+    
+    // Collect all pickup coordinates
+    const waypoints = allRides.map(r => r.pickup_location.coordinates);
+    // Add the common drop-off location
+    waypoints.push(existingCluster.drop_location.coordinates);
+
+    console.log(`[Clustering] Recalculating route for cluster ${existingCluster._id} with ${waypoints.length} points`);
+    const newPolyline = await getRoute(waypoints);
+
     const updatedCluster = await Clustering.findByIdAndUpdate(
       existingCluster._id,
       {
         $push: { ride_ids: newRide._id },
         current_size: newTotalSize,
+        pickup_polyline: {
+          type: "LineString",
+          coordinates: newPolyline
+        },
         $push: {
           "metadata.merge_events": {
             merged_at: new Date(),
@@ -510,11 +475,6 @@ export const mergeClusters = async (newRide, existingCluster) => {
       },
       { new: true }
     );
-
-    // Update ride status
-    await RideRequest.findByIdAndUpdate(newRide._id, {
-      status: "IN_CLUSTERING",
-    });
 
     return updatedCluster;
   } catch (error) {
@@ -528,11 +488,14 @@ export const mergeClusters = async (newRide, existingCluster) => {
  */
 export const moveToBatched = async (cluster, forceBatched = false, reason = null) => {
   try {
+    // Ensure all ride_ids are unique ObjectIds to avoid duplication or type issues
+    const uniqueRideIds = [...new Set(cluster.ride_ids.map(id => id.toString()))].map(id => new mongoose.Types.ObjectId(id));
+
     const batched = await Batched.create({
       office_id: cluster.office_id,
       scheduled_at: cluster.scheduled_at,
-      ride_ids: cluster.ride_ids,
-      batch_size: cluster.current_size,
+      ride_ids: uniqueRideIds,
+      batch_size: uniqueRideIds.length,
       pickup_polyline: cluster.pickup_polyline,
       pickup_centroid: cluster.pickup_centroid,
       drop_location: cluster.drop_location,
@@ -544,20 +507,22 @@ export const moveToBatched = async (cluster, forceBatched = false, reason = null
       },
     });
 
-    // Update cluster status
+    // Update cluster status to indicate it has been promoted to a batch
     await Clustering.findByIdAndUpdate(cluster._id, {
       status: "BATCHED",
       batch_id: batched._id,
     });
 
-    // Update all rides in the batch
+    // Update all rides in the batch to common 'CLUSTERED' status
     await RideRequest.updateMany(
-      { _id: { $in: cluster.ride_ids } },
+      { _id: { $in: uniqueRideIds } },
       {
         status: "CLUSTERED",
         batch_id: batched._id,
       }
     );
+
+    console.log(`[Batching] Successfully promoted cluster ${cluster._id} to batch ${batched._id} with ${uniqueRideIds.length} rides.`);
 
     return batched;
   } catch (error) {

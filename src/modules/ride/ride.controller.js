@@ -131,11 +131,17 @@ export const bookRide = async (req, res, next) => {
       console.log("\n--- AUTO-SUBMITTING TO POLLING ---");
       const pollingResult = await routeRideRequest(ride);
       console.log("Polling Result:", pollingResult);
+
+      // CRITICAL: Refetch the ride to get the MODIFIED status from the polling system
+      const updatedRide = await RideRequest.findById(ride._id)
+        .populate('employee_id', 'name email profile_image')
+        .populate('office_id', 'name office_location shift_start shift_end')
+        .populate('invited_employee_ids', 'name email profile_image');
       
       res
         .status(201)
         .json(new ApiResponse(201, "Ride booked and submitted to polling successfully", {
-          ride,
+          ride: updatedRide || ride,
           polling: pollingResult
         }));
     } else {
@@ -143,6 +149,67 @@ export const bookRide = async (req, res, next) => {
     }
   } catch (e) {
     next(e);
+  }
+};
+
+/**
+ * Get the current active ride for the user
+ */
+export const getCurrentRide = async (req, res, next) => {
+  try {
+    const userId = req.user._id;
+
+    // Find latest active ride (not completed or cancelled)
+    const ride = await RideRequest.findOne({
+      employee_id: userId,
+      status: { $in: ["PENDING", "IN_CLUSTERING", "CLUSTERED", "ACCEPTED", "ARRIVED", "STARTED"] },
+    })
+      .sort({ createdAt: -1 })
+      .populate("employee_id", "name email profile_image")
+      .populate("office_id", "name office_location shift_start shift_end")
+      .populate("invited_employee_ids", "name email profile_image");
+
+    if (!ride) {
+      return res.status(200).json(new ApiResponse(200, "No active ride found", null));
+    }
+
+    // Reuse population logic
+    const responseData = { ...ride.toJSON() };
+
+    if (ride.status === "IN_CLUSTERING") {
+      const { Clustering } = await import("../polling/clustering.model.js");
+      const cluster = await Clustering.findOne({ ride_ids: ride._id });
+      if (cluster) {
+        responseData.clustering = {
+          cluster_id: cluster._id,
+          current_size: cluster.current_size,
+          status: cluster.status,
+          pickup_polyline: cluster.pickup_polyline,
+          ride_ids: cluster.ride_ids,
+        };
+      }
+    }
+
+    if (
+      ride.batch_id ||
+      ["CLUSTERED", "ACCEPTED", "ARRIVED", "STARTED"].includes(ride.status)
+    ) {
+      const { Batched } = await import("../polling/batched.model.js");
+      const batch = await Batched.findById(ride.batch_id);
+      if (batch) {
+        responseData.batch = {
+          batch_id: batch._id,
+          batch_size: batch.batch_size,
+          status: batch.status,
+          pickup_polyline: batch.pickup_polyline,
+          driver_id: batch.driver_id,
+        };
+      }
+    }
+
+    return res.status(200).json(new ApiResponse(200, "Active ride fetched", responseData));
+  } catch (error) {
+    next(error);
   }
 };
 
@@ -289,7 +356,49 @@ export const getRideById = async (req, res, next) => {
 
     if (!ride) throw new ApiError(404, "Ride not found");
 
-    res.status(200).json(new ApiResponse(200, "Ride retrieved successfully", ride));
+    // NEW: Include polling/clustering info for frontend visualization
+    let responseData = { ...ride.toJSON() };
+
+    // Check if ride is part of an active cluster/batch even if status is PENDING/IN_CLUSTERING
+    // This solves the sync issue for joiners who might still see 'PENDING'
+    if (!["CANCELLED", "COMPLETED", "DROPPED_OFF", "REJECTED"].includes(ride.status)) {
+      const { Clustering } = await import('../polling/clustering.model.js');
+      const { Batched } = await import('../polling/batched.model.js');
+
+      // 1. Try to find a batch (highest priority)
+      const batch = await Batched.findOne({ 
+        $or: [
+          { _id: ride.batch_id },
+          { ride_ids: ride._id }
+        ]
+      });
+
+      if (batch) {
+        responseData.batch = {
+          batch_id: batch._id,
+          batch_size: batch.batch_size,
+          status: batch.status,
+          pickup_polyline: batch.pickup_polyline,
+          driver_id: batch.driver_id,
+        };
+        // If we found a batch, we also ensure status reflection for the frontend
+        if (ride.status === 'PENDING') responseData.status = 'CLUSTERED';
+      } else {
+        // 2. Try to find a cluster
+        const cluster = await Clustering.findOne({ ride_ids: ride._id });
+        if (cluster) {
+          responseData.clustering = {
+            cluster_id: cluster._id,
+            current_size: cluster.current_size,
+            status: cluster.status,
+            pickup_polyline: cluster.pickup_polyline,
+          };
+          if (ride.status === 'PENDING') responseData.status = 'IN_CLUSTERING';
+        }
+      }
+    }
+
+    res.status(200).json(new ApiResponse(200, "Ride retrieved successfully", responseData));
   } catch (error) {
     next(error || new ApiError(500, "Error retrieving ride"));
   }
